@@ -79,6 +79,27 @@
 
 Payload JSON 优先取: `mac_last4` > `mac` > `device_id` > `device` > `node_id` > `id` → 最后 4 字符 → MD5 fallback
 
+### EMQX 隔离 Docker 化
+
+- 仓库: `https://github.com/BH4ME/emqx-isolated`
+- 一键部署: `docker compose up -d`，自动配置 ACL、用户、持久化
+- 包含 PostgreSQL 16 + EMQX 6.0 + 用户自动初始化
+
+**ACL 隔离** (`emqx/acl.conf`):
+
+| 用户 | 权限范围 |
+|------|----------|
+| `coap-server` | `sensor/#` `industrial/#` |
+| `nrf` | `sensor/#` `industrial/#` |
+| `sensor-device` | `sensor/#` |
+| `vessel` | `vessel/#` (完全隔离) |
+
+默认策略: `no_match=deny`，未匹配一律拒绝
+
+**可配置项** (`.env`):
+- `PG_HOST` / `PG_PORT` / `PG_DB` / `PG_USER` / `PG_PASS` — 外部 PostgreSQL
+- `EMQX_DASHBOARD_USER` / `EMQX_DASHBOARD_PASS` — 控制台密码
+
 ---
 
 ## 2026-05-15 — 初始搭建
