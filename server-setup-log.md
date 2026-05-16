@@ -1,119 +1,133 @@
 # 服务器配置日志
 
-**日期**: 2026-05-15  
 **服务器**: 47.251.162.209 (阿里云 us-west-1)  
 **操作系统**: Ubuntu 22.04.5 LTS
 
 ---
 
-## 1. Cockpit 面板修复 & 配置
+## 2026-05-16 — IoT 多协议后端 & 多节点支持
 
-- 安装 `sscg` 修复 Cockpit 证书生成错误
-- 通过 nginx 反向代理，从 `https://47.251.162.209:9090` → `https://ray.mecho.top`
-- 签发 Let's Encrypt 正规 SSL 证书
+### CoAP Server 重构
 
-**访问**: `https://ray.mecho.top`
+- 支持多节点上传，按 `mac_last4` / `mac` / `device_id` 后 4 位隔离存储
+- POST `/sensor` → 自动转发到 MQTT，注入 `"source": "coap"`
+- 启动时从 PostgreSQL `mqtt_messages` 表加载缓存，重启数据不丢
+- systemd: `coap-server.service`
+- 地址: `coap://coap.mecho.top:5683/sensor`
 
----
+### CoAP Gateway
 
-## 2. 用户管理
+- HTTP → CoAP 桥接: `172.19.0.1:5684`
+- nginx: `https://coap.mecho.top` → gateway
+- GET `https://coap.mecho.top/sensor` 返回所有节点最新 JSON
 
-| 用户名 | 密码 | sudo | SSH |
-|--------|------|------|-----|
-| root | 原有 | ✅ | 密钥 |
-| admin | 原有 | ✅ | 密钥 |
-| owen | 67215837 | ✅ | 密钥 |
+### MQTT (EMQX)
 
----
+- 新建 MQTT 用户 `coap-server` / `coap123456`，设备共用
+- 统一主题: `sensor/{device_id}/data`（device_id = mac 后 4 位）
+- EMQX 规则 `persist_all_mqtt_messages` 自动持久化所有消息到 PostgreSQL
 
-## 3. SSH 安全加固
+### SSH 加固
 
-- **fail2ban**: 10分钟内失败3次封禁2小时
-- **禁用密码登录**: 仅允许 SSH 密钥认证
-- **root 限制**: `PermitRootLogin prohibit-password`
+- MaxStartups: 10:30:100 → 100:30:200（防暴力破解误杀合法连接）
+- 新增 PerSourceMaxStartups 5（单 IP 限制）
 
-### SSH 密钥
+### 数据流
 
-**admin**:
 ```
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDqs52IkIWCNOprzWhdALpxfi2TO/dCLEMkgFurgoAQz admin@ray.mecho.top
-```
-
-**owen**:
-```
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINTRhRVJuLtf1c7WHyr8pwOLLCWttn+b20OKm7YAcVyL owen@ray.mecho.top
+设备 ──CoAP──→ coap-server:5683 ──MQTT──→ EMQX ──规则──→ PostgreSQL
+设备 ──MQTT──→ EMQX:1883 ───────────────────────────→ PostgreSQL  
+前端 ←──HTTPS── coap.mecho.top/sensor  ←── 内存缓存
+前端 ←──WSS──── mqtt.mecho.top/mqtt    ←── 实时推送
 ```
 
-连接方式:
-```bash
-ssh -i <私钥文件> admin@ray.mecho.top
-ssh -i <私钥文件> owen@ray.mecho.top
-```
+### 接口速查
 
----
+| 用途 | 协议 | 地址 | 认证 |
+|------|------|------|------|
+| 设备上报 | CoAP | `coap://coap.mecho.top:5683/sensor` | 无 |
+| 设备上报 | MQTT | `mqtt.mecho.top:1883` | coap-server / coap123456 |
+| 前端查询 | HTTP | `GET https://coap.mecho.top/sensor` | 无 |
+| 前端实时 | MQTT WS | `wss://mqtt.mecho.top/mqtt` | coap-server / coap123456 |
+| 历史数据 | PG | `100.89.61.8:5432` (Tailscale) | mqtt / mqttpass |
+| 控制台 | Web | `https://mqtt.mecho.top` | admin / Aa797900 |
 
-## 4. EMQX MQTT Broker
+### MQTT 主题
 
-- 版本: EMQX 6.0.0 (Docker)
-- Dashboard: `https://mqtt.mecho.top`
-- 账号: `admin` / `Aa797900`
+| 主题 | 方向 | 说明 |
+|------|------|------|
+| `sensor/{id}/data` | 设备→服务器 | 传感器上报 |
+| `sensor/+/data` | 前端订阅 | 通配符，实时接收所有设备 |
 
-### 连接地址
+### 区分来源
 
-| 方式 | 地址 |
+| source 值 | 含义 |
+|-----------|------|
+| `"coap"` | CoAP 设备，服务器自动添加 |
+| `"mqtt"` | MQTT 设备，设备端写入 |
+
+### 修改文件
+
+| 文件 | 改动 |
 |------|------|
-| MQTT TCP | `mqtt.mecho.top:1883` |
-| MQTT WebSocket | `wss://mqtt.mecho.top/mqtt` |
+| `/home/admin/coap-server/server.py` | 多节点隔离 + MQTT 转发 + PG 持久化 + source 标记 |
+| `/home/admin/coap-gateway/gateway.py` | 提示更新 |
+| `/etc/ssh/sshd_config` | MaxStartups 100:30:200 + PerSourceMaxStartups 5 |
+| `/home/admin/iot-api-docs.md` | 接口文档 |
 
-### EMQX 端口
+### 设备标识提取
 
-| 端口 | 协议 | 代理方式 |
-|------|------|----------|
-| 1883 | MQTT TCP | nginx stream → emqx |
-| 443 | MQTT WebSocket | nginx HTTPS /mqtt → emqx:8083 |
-| 443 | Dashboard | nginx HTTPS → emqx:18083 |
+Payload JSON 优先取: `mac_last4` > `mac` > `device_id` > `device` > `node_id` > `id` → 最后 4 字符 → MD5 fallback
 
 ---
 
-## 5. nginx 架构
+## 2026-05-15 — 初始搭建
+
+### Cockpit 面板
+
+- 安装 `sscg` 修复证书，nginx 反向代理
+- `https://ray.mecho.top` → `172.19.0.1:9090`
+
+### 用户
+
+| 用户名 | sudo | SSH |
+|--------|------|-----|
+| root | ✅ | 密钥 |
+| admin | ✅ | 密钥 |
+| owen | ✅ | 密钥 (67215837) |
+
+### SSH 安全
+
+- fail2ban (10分/3次/2小时)，禁用密码，PermitRootLogin prohibit-password
+
+### EMQX MQTT Broker
+
+- EMQX 6.0.0 Docker
+- Dashboard: `https://mqtt.mecho.top` — `admin` / `Aa797900`
+
+### nginx
 
 ```
-外网
-├─ :80   → HTTP (Let's Encrypt验证 + HTTPS跳转)
-├─ :443  → ray.mecho.top  → Cockpit (172.19.0.1:9090)
-│         → mqtt.mecho.top → EMQX Dashboard (emqx:18083)
-│                           → MQTT WebSocket /mqtt (emqx:8083)
-└─ :1883 → MQTT TCP stream → emqx:1883
+:80   → HTTP (Let's Encrypt + HTTPS)
+:443  → ray.mecho.top  → Cockpit (9090)
+:443  → mqtt.mecho.top → EMQX Dashboard (18083) + WS (8083)
+:443  → coap.mecho.top → CoAP Gateway (5684)   ← new
+:1883 → MQTT TCP → EMQX
 ```
 
----
+### Docker
 
-## 6. Docker 容器
+| 容器 | 用途 |
+|------|------|
+| nginx | 入口网关 |
+| emqx | MQTT Broker |
+| postgres | PostgreSQL 16 |
+| certbot | SSL |
 
-| 容器 | 镜像 | 端口 |
-|------|------|------|
-| nginx | nginx:alpine | 80, 443, 1883 |
-| certbot | certbot/certbot:latest | - |
-| emqx | emqx/emqx:latest | 内部网络 |
+### SSL
 
-配置路径: `/srv/web/` (docker-compose)
-
----
-
-## 7. 安全组需开放端口
-
-| 端口 | 协议 | 用途 |
-|------|------|------|
-| 22 | TCP | SSH |
-| 80 | TCP | HTTP |
-| 443 | TCP | HTTPS |
-| 1883 | TCP | MQTT |
-
----
-
-## 8. SSL 证书
-
-| 域名 | 到期 | 自动续期 |
-|------|------|----------|
-| ray.mecho.top | 2026-08-13 | certbot ✅ |
-| mqtt.mecho.top | 2026-08-13 | certbot ✅ |
+| 域名 | 到期 |
+|------|------|
+| ray.mecho.top | 2026-08-13 |
+| mqtt.mecho.top | 2026-08-13 |
+| coap.mecho.top | 2026-08-13 |
